@@ -8,7 +8,7 @@
 [project]
 id = "HexBrowns.MidpointTable_H"
 name = "MidpointTable_H"
-version = "0.4.2"
+version = "0.5.0"
 
 [artifacts."MidpointTable_H.aux2"]
 build = "cargo build --release"

@@ -29,10 +29,20 @@ pub struct Loaded {
 /// 監視で取るもの
 pub struct Poll {
     pub focused: Option<ObjectHandle>,
-    /// 表のオブジェクトの今のエイリアス。消えていれば `None`
-    pub bound_alias: Option<String>,
+    /// 表のオブジェクトの今の状態
+    pub bound: Bound,
     /// 本体で選んでいる区間（フォーカス中のオブジェクトの）
     pub focus_section: Option<usize>,
+}
+
+/// 表のオブジェクトの状態
+pub enum Bound {
+    /// エイリアスを読まなかった（軽い読み取り）。オブジェクトはある
+    Unchecked,
+    /// 消えた
+    Missing,
+    /// 今のエイリアス
+    Alias(String),
 }
 
 fn ready() -> Result<(), String> {
@@ -43,17 +53,22 @@ fn ready() -> Result<(), String> {
     }
 }
 
-/// 監視。起動直後で本体の準備ができていなければ `Ok(None)`（警告にしない）
-pub fn poll(bound: Option<ObjectHandle>) -> Result<Option<Poll>, String> {
+/// 監視。起動直後で本体の準備ができていなければ `Ok(None)`（警告にしない）。
+/// `with_alias` が偽なら表のオブジェクトのエイリアスを読まない（中間点が多いと長く、本体に作らせるのが重い）
+pub fn poll(bound: Option<ObjectHandle>, with_alias: bool) -> Result<Option<Poll>, String> {
     if !EDIT_HANDLE.is_ready() {
         return Ok(None);
     }
     EDIT_HANDLE
         .call_read_section(move |read| {
             let focused = read.get_focused_object().ok().flatten();
-            let bound_alias = bound.filter(|h| read.object_exists(*h)).and_then(|h| read.get_object_alias(h).ok());
+            let bound = match bound.filter(|h| read.object_exists(*h)) {
+                None => Bound::Missing,
+                Some(_) if !with_alias => Bound::Unchecked,
+                Some(h) => read.get_object_alias(h).map(Bound::Alias).unwrap_or(Bound::Missing),
+            };
             let focus_section = read.get_focus_object_section().ok().flatten();
-            Some(Poll { focused, bound_alias, focus_section })
+            Some(Poll { focused, bound, focus_section })
         })
         .map_err(|e| format!("読み取りに失敗しました: {e}"))
 }

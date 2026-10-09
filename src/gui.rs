@@ -1,6 +1,13 @@
 //! 中間点の表のウィンドウ（egui）
 //!
-//! 監視（0.4 秒ごと）は読み取りだけ。書き込みは「反映」ボタンからだけ行う。セルのドラッグも未反映の書き換えになるだけ。
+//! 監視は読み取りだけ。書き込みは「反映」ボタンからだけ行う。セルのドラッグも未反映の書き換えになるだけ。
+//!
+//! 監視の重さを抑える（v0.5.0。`issues/20261010_heavy_with_many_midpoints_and_polls_while_hidden.md`）:
+//! - ウィンドウが見えていない間は何も読まず、何も描かない（eframe は SW_HIDE のウィンドウでも `ui` を呼ぶ）
+//! - 表のオブジェクトのエイリアスは、本体のイベント（`lib.rs` の `OBJECT_DIRTY`）が来たときだけ読む（0.4 秒に 1 回まで）。
+//!   フォーカスと区間の印は、エイリアスを読まない軽い読み取りで 1 秒ごとに追う
+//! - 「自動で読み直す」を切ると、「再読み込み」を押したときだけ読む
+//! - 表は見えている行（と前後の余白・選択・編集中の行）だけを作る
 //!
 //! キー操作（Ctrl+C / Ctrl+V / 矢印 / Enter / Esc）は、表のセルにフォーカスがあるときだけ受ける。
 //! aviutl2-eframe は egui のどこにもフォーカスが無いときだけキーを本体へ渡す（`egui_wants_keyboard_input`）ので、
@@ -14,12 +21,28 @@ use aviutl2_eframe::{eframe, egui, AviUtl2EframeHandle};
 
 use std::sync::Arc;
 
-use crate::edit_ops::{self, Loaded, Outcome, Structure};
+use std::sync::atomic::Ordering;
+
+use crate::edit_ops::{self, Bound, Loaded, Outcome, Structure};
 use crate::movement::{self, Scan};
 use crate::prefs::Prefs;
 use crate::table::{Column, ModeChange, Selection};
+use crate::OBJECT_DIRTY;
 
+/// 本体のイベントで読み直す間隔の下限
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
+/// フォーカスと区間の印を追う軽い読み取りの間隔
+const LIGHT_INTERVAL: Duration = Duration::from_millis(1000);
+/// 見えていない間に、また見えるようになったかを確かめる間隔
+const HIDDEN_CHECK: Duration = Duration::from_millis(500);
+/// これより長く見えていたウィンドウが隠れたら、ログに出す（起動直後の一瞬を数えない）
+const SHOWN_LONG: Duration = Duration::from_secs(2);
+/// 表の 1 行の高さ（見えていない行はこの高さの空きにする）
+const ROW_H: f32 = 18.0;
+/// 見えている範囲の上下に余分に作る高さ
+const ROW_MARGIN: f32 = 200.0;
+/// 表の読み込みがこれより長くかかったら、1 回だけログに出す
+const SLOW_LOAD: Duration = Duration::from_millis(100);
 const CELL_W: f32 = 76.0;
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(235, 200, 90);
 const RED: egui::Color32 = egui::Color32::from_rgb(235, 110, 110);
@@ -28,6 +51,8 @@ const DRAG_STEP: f64 = 1.0;
 
 /// セルのドラッグ中の状態
 struct Drag {
+    /// 掴んだセル（見えている範囲の外へスクロールしても、その行は作り続ける）
+    origin: (usize, usize),
     targets: Vec<((usize, usize), f64)>,
     offset: f64,
 }
@@ -52,6 +77,11 @@ pub struct MidpointTableApp {
     drag: Option<Drag>,
     /// キー操作を受けるためにフォーカスを置いたセルの Id
     key_focus: Option<egui::Id>,
+    /// そのセルの行（作らないとフォーカスが外れるので、見えていなくても作る）
+    key_focus_row: Option<usize>,
+    /// ウィンドウが見え始めた時刻（見えていなければ None）
+    visible_since: Option<Instant>,    /// 読み込みが遅かったことを 1 回だけログに出した
+    slow_load_logged: bool,
     /// 本体に登録されている移動方法（起動時に 1 回作る。`movement.rs`）
     movements: Arc<Scan>,
     mode_filter: String,
@@ -84,6 +114,8 @@ impl MidpointTableApp {
             style.visuals = aviutl2_eframe::aviutl2_visuals();
         });
         cc.egui_ctx.set_fonts(aviutl2_eframe::aviutl2_fonts());
+        // 本体のイベントから UI を起こせるようにする
+        let _ = crate::EGUI_CTX.set(cc.egui_ctx.clone());
         Self {
             _handle: handle,
             loaded: None,
@@ -101,6 +133,9 @@ impl MidpointTableApp {
             last_poll_error: None,
             drag: None,
             key_focus: None,
+            key_focus_row: None,
+            visible_since: None,
+            slow_load_logged: false,
             movements,
             mode_filter: String::new(),
             settings_col: None,
@@ -129,7 +164,22 @@ impl MidpointTableApp {
 
     fn load(&mut self, handle: ObjectHandle) {
         let selection = self.loaded.as_ref().filter(|l| l.handle == handle).and_then(|l| l.table.selection);
-        match edit_ops::load(handle, self.prefs.clone()) {
+        let started = Instant::now();
+        let result = edit_ops::load(handle, self.prefs.clone());
+        let took = started.elapsed();
+        if let Ok(l) = &result {
+            // 重さの目安（実機での切り分け用。毎回は出さない）
+            if took >= SLOW_LOAD && !self.slow_load_logged {
+                self.slow_load_logged = true;
+                tracing::info!(
+                    "[MidpointTable_H] 表の読み込みに {} ms かかりました（点 {}・列 {}）",
+                    took.as_millis(),
+                    l.table.points(),
+                    l.table.columns.len()
+                );
+            }
+        }
+        match result {
             Ok(mut l) => {
                 // 同じオブジェクトを読み直したときは選択を残す（表の大きさに収まる範囲で）
                 if let Some(sel) = selection {
@@ -151,15 +201,43 @@ impl MidpointTableApp {
         }
     }
 
-    fn poll(&mut self) {
-        let due = self.last_poll.is_none_or(|t| t.elapsed() >= POLL_INTERVAL);
-        if !due {
+    /// 読み直しが要るか決めて読む。本体のイベントが来ていればエイリアスまで、来ていなければ 1 秒ごとにフォーカスだけ
+    fn poll_if_due(&mut self, ctx: &egui::Context) {
+        let since = self.last_poll.map(|t| t.elapsed());
+        let dirty = OBJECT_DIRTY.load(Ordering::Acquire);
+        if !dirty && since.is_some_and(|d| d < LIGHT_INTERVAL) {
             return;
         }
+        // イベントが続けて来ても 0.4 秒に 1 回まで（本体のトラックバーをドラッグしている間など）
+        if let Some(d) = since.filter(|d| *d < POLL_INTERVAL) {
+            ctx.request_repaint_after(POLL_INTERVAL - d);
+            return;
+        }
+        let full = OBJECT_DIRTY.swap(false, Ordering::AcqRel);
+        self.poll(full);
+    }
+
+    /// フォーカスだけを読む（自動で読み直さない設定の「再読み込み」）。読めたら真
+    fn refresh_focus(&mut self) -> bool {
+        match edit_ops::poll(None, false) {
+            Ok(Some(p)) => {
+                self.focused = p.focused;
+                self.focus_section = p.focus_section;
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                self.set_status(e, true);
+                false
+            }
+        }
+    }
+
+    fn poll(&mut self, full: bool) {
         self.last_poll = Some(Instant::now());
         // 消えたオブジェクトのハンドルは渡さない（渡すたびに本体が invalid object handle の WARN を出す）
         let bound = self.loaded.as_ref().filter(|_| !self.bound_missing).map(|l| l.handle);
-        let p = match edit_ops::poll(bound) {
+        let p = match edit_ops::poll(bound, full) {
             Ok(None) => return,
             Ok(Some(p)) => {
                 self.last_poll_error = None;
@@ -180,15 +258,15 @@ impl MidpointTableApp {
 
         if let Some(l) = self.loaded.as_ref().filter(|_| !self.bound_missing) {
             let handle = l.handle;
-            match &p.bound_alias {
-                None => {
+            match &p.bound {
+                Bound::Missing => {
                     if pending {
                         self.bound_missing = true;
                     } else {
                         self.loaded = None;
                     }
                 }
-                Some(a) if *a != l.alias_raw => {
+                Bound::Alias(a) if *a != l.alias_raw => {
                     if pending {
                         self.host_changed = true;
                     } else {
@@ -306,10 +384,26 @@ impl MidpointTableApp {
                 }
             }
             let reload = if pending > 0 { "再読み込み（未反映を捨てる）" } else { "再読み込み" };
-            if ui.button(reload).clicked() {
-                let target = if self.focus_moved { self.focused } else { self.loaded.as_ref().map(|l| l.handle).or(self.focused) };
+            let tip = if self.prefs.auto_reload { "表を読み直します" } else { "本体で選んでいるオブジェクトの表を読み直します" };
+            if ui.button(reload).on_hover_text(tip).clicked() {
+                // 自動で読み直さない設定では、フォーカスもここで初めて読む
+                let follow = self.focus_moved || (!self.prefs.auto_reload && self.refresh_focus());
+                let loaded = self.loaded.as_ref().map(|l| l.handle);
+                let target = if follow { self.focused.or(loaded) } else { loaded.or(self.focused) };
                 if let Some(h) = target {
                     self.load(h);
+                }
+            }
+            let mut auto = self.prefs.auto_reload;
+            let r = ui.checkbox(&mut auto, "自動で読み直す").on_hover_text(
+                "本体でオブジェクトを選び直したり値を変えたりしたときに、表を読み直します。\n\
+                 外すと、「再読み込み」を押したときだけ読みます（選んだオブジェクトにも付いていきません）",
+            );
+            if r.changed() {
+                self.prefs.set_auto_reload(auto);
+                if auto {
+                    // 外していた間の変化を拾う
+                    OBJECT_DIRTY.store(true, Ordering::Release);
                 }
             }
         });
@@ -539,6 +633,17 @@ impl MidpointTableApp {
         let mut frame_start: Option<usize> = None;
         let pending_total = table.pending_count();
         let n_points = table.points();
+        let mut key_row: Option<usize> = None;
+        // 見えている範囲の外の行は作らない。ただし選択・編集・キー操作・ドラッグに使っている行は作る（作らないとフォーカスが外れる）
+        let clip = ui.clip_rect();
+        let mut keep: Vec<usize> = Vec::new();
+        if let Some(s) = table.selection {
+            keep.extend([s.anchor.0, s.end.0]);
+        }
+        keep.extend(self.editing.as_ref().map(|((r, _), _, _)| *r));
+        keep.extend(self.frame_editing.as_ref().map(|(r, _, _)| *r));
+        keep.extend(self.key_focus.and(self.key_focus_row));
+        keep.extend(self.drag.as_ref().map(|d| d.origin.0));
 
         egui::Grid::new("midpoint_table").striped(true).spacing([4.0, 2.0]).show(ui, |ui| {
             // 1 段目: 効果名（同じ効果が続くときは最初の列だけ）
@@ -670,6 +775,13 @@ impl MidpointTableApp {
             ui.end_row();
 
             for r in 0..table.points() {
+                // 行の上端（画面の座標）。見えている範囲から離れていれば、同じ高さの空きだけ置く
+                let top = ui.cursor().min.y;
+                if (top > clip.bottom() + ROW_MARGIN || top + ROW_H < clip.top() - ROW_MARGIN) && !keep.contains(&r) {
+                    ui.allocate_exact_size(egui::vec2(0.0, ROW_H), egui::Sense::hover());
+                    ui.end_row();
+                    continue;
+                }
                 let mark = if focus_row == Some(r) { "▶" } else { " " };
                 let midpoint = r > 0 && r + 1 < n_points;
                 match &mut self.frame_editing {
@@ -768,6 +880,7 @@ impl MidpointTableApp {
                             _ => Selection::single((r, c)),
                         });
                         focus_to = Some(resp.clone());
+                        key_row = Some(r);
                     }
                     if resp.double_clicked() && col.editable(r) {
                         start_edit = Some((r, c));
@@ -776,6 +889,7 @@ impl MidpointTableApp {
                         if resp.drag_started() {
                             drag_start = Some((r, c));
                             focus_to = Some(resp.clone());
+                            key_row = Some(r);
                         }
                         if resp.dragged() {
                             drag_dx += resp.drag_delta().x;
@@ -810,7 +924,7 @@ impl MidpointTableApp {
         }
         // 横ドラッグで値を増減する（未反映の書き換えになるだけ。本体へは「反映」で書く）
         if let Some(cell) = drag_start {
-            self.drag = Some(Drag { targets: table.drag_targets(cell), offset: 0.0 });
+            self.drag = Some(Drag { origin: cell, targets: table.drag_targets(cell), offset: 0.0 });
         }
         if let Some(d) = &mut self.drag {
             if drag_dx != 0.0 {
@@ -828,6 +942,7 @@ impl MidpointTableApp {
         if let Some(resp) = focus_to {
             resp.request_focus();
             self.key_focus = Some(resp.id);
+            self.key_focus_row = key_row;
         }
         if cancel_edit {
             self.editing = None;
@@ -1219,11 +1334,26 @@ impl MidpointTableApp {
 
 impl eframe::App for MidpointTableApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // セルを編集している間は監視で表を差し替えない
-        if self.editing.is_none() && self.frame_editing.is_none() {
-            self.poll();
+        // 本体のパネルに出ていない間は、読みも描きもしない（イベントの印は残り、出たときに読む）
+        let visible = crate::window_visible();
+        if !visible {
+            // 隠れるたびに 1 回出す（実機で判定が効いているかの目安）。起動直後は本体のパネルに入る前に一瞬見えてから隠れるので、
+            // しばらく見えていたときだけ出す（v0.5.0 の最初の版は 1 回限りにしていて、起動時に使い切っていた）
+            if self.visible_since.is_some_and(|t| t.elapsed() >= SHOWN_LONG) {
+                tracing::info!("[MidpointTable_H] ウィンドウが隠れました。見えていない間は表を読み直しません");
+            }
+            self.visible_since = None;
+            ui.ctx().request_repaint_after(HIDDEN_CHECK);
+            return;
         }
-        ui.ctx().request_repaint_after(POLL_INTERVAL);
+        self.visible_since.get_or_insert_with(Instant::now);
+        // セルを編集している間は監視で表を差し替えない
+        if self.prefs.auto_reload {
+            if self.editing.is_none() && self.frame_editing.is_none() {
+                self.poll_if_due(ui.ctx());
+            }
+            ui.ctx().request_repaint_after(LIGHT_INTERVAL);
+        }
         egui::Panel::top("top").show(ui, |ui| self.render_top(ui));
         egui::Panel::bottom("bottom").show(ui, |ui| self.render_bottom(ui));
         // 中央パネルは最後に追加する（ルール au2-rs-plugin「egui レイアウト」）

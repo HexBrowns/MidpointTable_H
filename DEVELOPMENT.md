@@ -23,8 +23,12 @@ python AI/tools/au2_build.py MidpointTable_H --deploy-root=C:/ProgramData/aviutl
 | `src/table.rs` | 表のモデル。未反映の管理、足す・掛ける・等間隔・同じ値・コピー・貼り付け |
 | `src/edit_ops.rs` | 読み取り（`call_read_section`）と反映（`call_edit_section`）、中間点を足す・動かす・消す |
 | `src/movement.rs` | 本体に登録されている移動方法の一覧（`.tra2` と組み込みから作る。`aviutl2.ini` は使わない） |
-| `src/prefs.rs` | 隠す列（`Plugin/MidpointTable_H/hidden_columns.txt`） |
-| `src/gui.rs` | ウィンドウ（egui）。0.4 秒ごとの監視 |
+| `src/prefs.rs` | 隠す列・列の並び順・自動で読み直すか（`Plugin/MidpointTable_H/hidden_columns.txt`） |
+| `src/gui.rs` | ウィンドウ（egui）と監視 |
+
+- 監視（v0.5.0）: 表のオブジェクトのエイリアスは、本体のイベント（`UPDATE_OBJECT` / `CHANGE_FOCUS_OBJECT` / `CHANGE_EDIT_SCENE`）が来たときだけ読む（0.4 秒に 1 回まで）。
+  フォーカスと区間の印は 1 秒ごとの軽い読み取りで追う。ウィンドウが見えていない（`IsWindowVisible` が偽）間は読みも描きもしない。
+  表は見えている行だけを作る。経緯は `issues/20261010_heavy_with_many_midpoints_and_polls_while_hidden.md`
 
 - 書き込みは「反映」ボタンからだけ。監視・フォーカスの変化からは書かない（本体の Undo を壊すため。ルール `au2-rs-plugin`）
 - 値の数は点の数に揃えてから書く（本体は数を検査しない）

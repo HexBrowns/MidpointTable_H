@@ -4,7 +4,8 @@
 //! 書き換えた値を「反映」でまとめて書き込む。仕様は `AI/specifications/20261008_MidpointTable_H_spec.md`、
 //! 根拠にした実機の結果は `AI/docs/20261008_パラメータ編集_SDK実機確認.md`。
 //!
-//! 自分で起こすスレッドは無い（監視は egui の更新の中で 0.4 秒ごとに読むだけ）。
+//! 自分で起こすスレッドは無い。監視は egui の更新の中で読むだけで、エイリアスを読むのは本体のイベント
+//! （オブジェクトの更新・フォーカスの変更・シーンの変更）が来たときだけ。ウィンドウが見えていない間は何も読まない。
 
 pub mod alias;
 mod edit_ops;
@@ -14,11 +15,13 @@ mod prefs;
 pub mod table;
 pub mod track;
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::OnceLock;
 
-use aviutl2::generic::GlobalEditHandle;
+use aviutl2::generic::{EventType, GlobalEditHandle};
 use aviutl2::raw_window_handle::HasWindowHandle;
 use aviutl2::AnyResult;
+use aviutl2_eframe::egui;
 use parking_lot::Mutex;
 
 pub const WINDOW_NAME: &str = "中間点の表";
@@ -27,6 +30,30 @@ pub(crate) static EDIT_HANDLE: GlobalEditHandle = GlobalEditHandle::new();
 
 /// ウィンドウの HWND（メニューから前に出すため）
 static WINDOW_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// 本体のイベントで立てる印。イベント用スレッドで立て、UI のスレッドで下ろす（ここから本体を読まない）
+pub(crate) static OBJECT_DIRTY: AtomicBool = AtomicBool::new(true);
+
+/// UI のスレッドを起こすための egui の Context（ウィンドウができたら入る）
+pub(crate) static EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
+
+/// 本体のイベント: 印を立てて UI を起こす。立っている間は起こし直さない（ドラッグ中の連続したイベントで描き直しを重ねない）
+fn on_host_event() {
+    if !OBJECT_DIRTY.swap(true, Ordering::AcqRel) {
+        if let Some(ctx) = EGUI_CTX.get() {
+            ctx.request_repaint();
+        }
+    }
+}
+
+/// ウィンドウが見えているか（本体のパネルに出ていなければ偽）。ハンドルが取れていなければ見えているとみなす
+pub(crate) fn window_visible() -> bool {
+    let hwnd = WINDOW_HWND.load(Ordering::Acquire);
+    if hwnd == 0 {
+        return true;
+    }
+    unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(windows::Win32::Foundation::HWND(hwnd as _)).as_bool() }
+}
 
 /// 中間点の表のウィンドウを表示して前に出す（ColorHistory_H の `open_window` と同じ）
 fn open_window() {
@@ -140,6 +167,11 @@ impl aviutl2::generic::GenericPlugin for MidpointTablePlugin {
         registry.register_layer_menu("中間点の表を開く", open_window);
         registry.register_edit_menu("中間点の表を開く", open_window);
         registry.register_edit_menu("中間点の表: 今のフレームに中間点を足す", add_midpoint_from_menu);
+
+        // 表を読み直す合図（フレームの移動は使わない。再生中に毎フレーム来るので、区間の印は 1 秒ごとの軽い読み取りで追う）
+        for ev in [EventType::UpdateObject, EventType::ChangeFocusObject, EventType::ChangeEditScene] {
+            registry.register_event_listener(ev, on_host_event);
+        }
     }
 }
 
