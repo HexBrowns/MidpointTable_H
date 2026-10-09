@@ -1,0 +1,25 @@
+[package]
+name = "midpoint-table-h"
+version = "0.4.2"
+edition = "2021"
+license = "MIT"
+authors = ["HexBrowns"]
+description = "MidpointTable_H - 中間点ごとのトラックバーの値を表で見て書き換える AviUtl2 プラグイン"
+publish = false
+
+[lib]
+name = "midpoint_table_h"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aviutl2 = { version = "0.48", features = ["generic"] }
+aviutl2-eframe = "0.48"
+# クリップボード（表計算ソフトとのコピー・貼り付け）。eframe が既に依存している版に合わせる
+arboard = { version = "3", default-features = false }
+parking_lot = "0.12"
+tracing = "0.1"
+# タイムラインの右クリックメニューから、隠れているウィンドウを前に出す（ColorHistory_H と同じ）
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.release]
+lto = true
