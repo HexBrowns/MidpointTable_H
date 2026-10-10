@@ -28,7 +28,7 @@ pub const WINDOW_NAME: &str = "中間点の表";
 
 pub(crate) static EDIT_HANDLE: GlobalEditHandle = GlobalEditHandle::new();
 
-/// ウィンドウの HWND（メニューから前に出すため）
+/// ウィンドウの HWND（見えているかを調べるため）
 static WINDOW_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// 本体のイベントで立てる印。イベント用スレッドで立て、UI のスレッドで下ろす（ここから本体を読まない）
@@ -53,22 +53,6 @@ pub(crate) fn window_visible() -> bool {
         return true;
     }
     unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(windows::Win32::Foundation::HWND(hwnd as _)).as_bool() }
-}
-
-/// 中間点の表のウィンドウを表示して前に出す（ColorHistory_H の `open_window` と同じ）
-fn open_window() {
-    let hwnd = WINDOW_HWND.load(Ordering::Acquire);
-    if hwnd == 0 {
-        tracing::warn!("[MidpointTable_H] ウィンドウがまだありません");
-        return;
-    }
-    unsafe {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_SHOW};
-        let hwnd = HWND(hwnd as _);
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
-    }
 }
 
 /// タイムラインの右クリック（オブジェクト）から: 選んだオブジェクトの今のフレームに中間点を足す。
@@ -161,11 +145,9 @@ impl aviutl2::generic::GenericPlugin for MidpointTablePlugin {
         }
         *self.window.lock() = Some(window);
 
-        // タイムラインの右クリック（オブジェクト・レイヤー）と編集メニュー（ショートカットを割り当てられる）
-        registry.register_object_menu("中間点の表\\表を開く", open_window);
+        // タイムラインの右クリック（オブジェクト）と編集メニュー（ショートカットを割り当てられる）。
+        // ウィンドウは表示メニューから開く（メニューから ShowWindow しても開かない。2026-10-10 にユーザーの指摘で「表を開く」を外した）
         registry.register_object_menu("中間点の表\\今のフレームに中間点を足す", add_midpoint_from_menu);
-        registry.register_layer_menu("中間点の表を開く", open_window);
-        registry.register_edit_menu("中間点の表を開く", open_window);
         registry.register_edit_menu("中間点の表: 今のフレームに中間点を足す", add_midpoint_from_menu);
 
         // 表を読み直す合図（フレームの移動は使わない。再生中に毎フレーム来るので、区間の印は 1 秒ごとの軽い読み取りで追う）
