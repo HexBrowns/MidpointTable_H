@@ -24,6 +24,45 @@ pub struct Loaded {
     pub hidden_here: Vec<(String, String)>,
     /// オブジェクトのレイヤー（0 始まり）
     pub layer: usize,
+    /// 表を読んだときに表示していたシーン
+    pub scene_id: i32,
+}
+
+impl Loaded {
+    /// 構造を変える前に比べるための、表を読んだときの印
+    pub fn bind(&self) -> Bind {
+        Bind { handle: self.handle, alias_raw: self.alias_raw.clone(), scene_id: self.scene_id }
+    }
+}
+
+/// 表を読んだときのオブジェクト。ハンドルは表を読んだ後も持ち越しているので、中間点の追加・移動・削除と複製の前に、
+/// シーンとエイリアスで同じオブジェクトか（表を読んだ後に変わっていないか）を確かめる
+/// （ルール au2-plugin-checklist「オブジェクトのハンドル」。ハンドルの値が使い回されるかは実機未確認）。
+/// エイリアスまで比べるので、表を読んだ後に本体で中間点が増減していたときも、古い行番号で動かさずに止まる
+#[derive(Debug, Clone)]
+pub struct Bind {
+    pub handle: ObjectHandle,
+    pub alias_raw: String,
+    pub scene_id: i32,
+}
+
+/// 今のシーンとエイリアス（読めなければ None）が、表を読んだときと同じか。違えば理由
+fn same_as_loaded(scene_now: i32, alias_now: Option<&str>, b: &Bind) -> Result<(), String> {
+    if scene_now != b.scene_id {
+        return Err("表を読んだときとシーンが違います。表のシーンに戻すか、表を読み直してください".into());
+    }
+    match alias_now {
+        None => Err("対象のオブジェクトがありません（削除された可能性があります）".into()),
+        Some(a) if a != b.alias_raw => {
+            Err("表を読んだ後にオブジェクトが変わっています（別のオブジェクトかもしれません）。表を読み直してください".into())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+fn check_bind(edit: &EditSection, b: &Bind) -> Result<(), String> {
+    let alias = if edit.object_exists(b.handle) { edit.get_object_alias(b.handle).ok() } else { None };
+    same_as_loaded(edit.info.scene_id, alias.as_deref(), b)
 }
 
 /// 監視で取るもの
@@ -75,12 +114,14 @@ pub fn poll(bound: Option<ObjectHandle>, with_alias: bool) -> Result<Option<Poll
 
 pub fn load(handle: ObjectHandle, prefs: Prefs) -> Result<Loaded, String> {
     ready()?;
+    // 編集情報は読み取りセクションに入る前に取る（ColorHistory_H と同じ）
+    let scene_id = EDIT_HANDLE.get_edit_info().scene_id;
     EDIT_HANDLE
-        .call_read_section(move |read| load_in(read, handle, &prefs))
+        .call_read_section(move |read| load_in(read, handle, &prefs, scene_id))
         .map_err(|e| format!("読み取りに失敗しました: {e}"))?
 }
 
-fn load_in(read: &ReadSection, handle: ObjectHandle, prefs: &Prefs) -> Result<Loaded, String> {
+fn load_in(read: &ReadSection, handle: ObjectHandle, prefs: &Prefs, scene_id: i32) -> Result<Loaded, String> {
     let hidden = &prefs.hidden;
     let alias_raw = read.get_object_alias(handle).map_err(|e| format!("エイリアスを取れません: {e}"))?;
     let parsed = alias::parse(&alias_raw);
@@ -153,7 +194,16 @@ fn load_in(read: &ReadSection, handle: ObjectHandle, prefs: &Prefs) -> Result<Lo
         .unwrap_or_default();
     let label = format!("L{} 「{}」 {}-{}  中間点 {} 個", lf.layer + 1, name, lf.start, lf.end, points - 2);
 
-    Ok(Loaded { handle, alias_raw, label, table: Table { frames, columns, checks, selection: None }, notes, hidden_here, layer: lf.layer })
+    Ok(Loaded {
+        handle,
+        alias_raw,
+        label,
+        table: Table { frames, columns, checks, selection: None },
+        notes,
+        hidden_here,
+        layer: lf.layer,
+        scene_id,
+    })
 }
 
 /// 本体の今のフレーム（シーン基準）
@@ -172,13 +222,12 @@ pub enum Structure {
     Delete { row: usize },
 }
 
-pub fn change_structure(handle: ObjectHandle, op: Structure) -> Result<String, String> {
+pub fn change_structure(bind: Bind, op: Structure) -> Result<String, String> {
     ready()?;
     EDIT_HANDLE
         .call_edit_section(move |edit| -> Result<String, String> {
-            if !edit.object_exists(handle) {
-                return Err("対象のオブジェクトがありません".into());
-            }
+            check_bind(edit, &bind)?;
+            let handle = bind.handle;
             let lf = edit.get_object_layer_frame(handle).map_err(|e| e.to_string())?;
             let frames = edit.get_object_section_frames(handle).map_err(|e| e.to_string())?;
             let n = frames.len(); // 区間の数。行（点）は n + 1 個で、最後の行は lf.end
@@ -231,7 +280,7 @@ pub fn placements(layer: usize, start: usize, len: usize, interval: usize, count
 /// 周期複製。元のオブジェクトをエイリアスごと写し（中間点・効果・設定を含む）、`shifts` の項目は k 個目に `raws[k-1]` を書く。
 /// 置き場所が 1 つでも埋まっていれば何も作らない。1 回の `call_edit_section` で作るので、本体の Undo 1 回分になる想定
 pub fn duplicate(
-    handle: ObjectHandle,
+    bind: Bind,
     interval: usize,
     count: usize,
     below: bool,
@@ -240,9 +289,9 @@ pub fn duplicate(
     ready()?;
     EDIT_HANDLE
         .call_edit_section(move |edit| -> Result<String, String> {
-            if !edit.object_exists(handle) {
-                return Err("対象のオブジェクトがありません".into());
-            }
+            // 写すエイリアスが表を読んだときのものと同じことも、ここで確かめる（ずらす値は表の値から作っている）
+            check_bind(edit, &bind)?;
+            let handle = bind.handle;
             let lf = edit.get_object_layer_frame(handle).map_err(|e| e.to_string())?;
             let len = lf.end - lf.start + 1;
             let places = placements(lf.layer, lf.start, len, interval, count, below)?;
@@ -295,7 +344,18 @@ pub fn duplicate(
 
 #[cfg(test)]
 mod tests {
-    use super::placements;
+    use super::{placements, same_as_loaded, Bind};
+    use aviutl2::generic::ObjectHandle;
+
+    #[test]
+    fn bind_compares_scene_and_alias() {
+        let b = Bind { handle: ObjectHandle::from(std::ptr::null_mut()), alias_raw: "[Object]\nframe=0,30,59\n".into(), scene_id: 1 };
+        assert!(same_as_loaded(1, Some("[Object]\nframe=0,30,59\n"), &b).is_ok());
+        // シーンが違う・消えた・中身が変わった（中間点が増えた・別のオブジェクト）は止める
+        assert!(same_as_loaded(0, Some("[Object]\nframe=0,30,59\n"), &b).is_err());
+        assert!(same_as_loaded(1, None, &b).is_err());
+        assert!(same_as_loaded(1, Some("[Object]\nframe=0,20,30,59\n"), &b).is_err());
+    }
 
     #[test]
     fn duplicate_placements() {

@@ -55,26 +55,77 @@ pub(crate) fn window_visible() -> bool {
     unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(windows::Win32::Foundation::HWND(hwnd as _)).as_bool() }
 }
 
-/// タイムラインの右クリック（オブジェクト）から: 選んだオブジェクトの今のフレームに中間点を足す。
+/// メニューの結果（文, 失敗があったか）。メニューにはウィンドウが無いので、表のウィンドウの状態の行にも出す。
+/// メニューのスレッドで入れ、UI のスレッドで取り出す
+pub(crate) static MENU_RESULT: Mutex<Option<(String, bool)>> = parking_lot::const_mutex(None);
+
+/// 1 つのオブジェクトの `frame`（シーン基準）に中間点を足す
+fn add_midpoint_one(edit: &aviutl2::generic::EditSection, handle: aviutl2::generic::ObjectHandle, frame: usize) -> Result<(), String> {
+    let lf = edit.get_object_layer_frame(handle).map_err(|e| format!("位置を読めません: {e}"))?;
+    if frame <= lf.start || frame >= lf.end {
+        return Err("今のフレームがオブジェクトの中（開始と終了の間）にありません".into());
+    }
+    if edit.get_object_section_frames(handle).is_ok_and(|f| f.contains(&frame)) {
+        return Err("既に中間点があります".into());
+    }
+    edit.create_object_section(handle, frame).map_err(|e| format!("足せませんでした: {e}"))
+}
+
+/// メニューの結果を 1 行にまとめる（文, 失敗があったか）。`results` は (場所, 結果) をオブジェクトごとに
+fn summarize_menu(frame: usize, results: &[(String, Result<(), String>)]) -> (String, bool) {
+    let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
+    let failed: Vec<String> = results.iter().filter_map(|(place, r)| r.as_ref().err().map(|e| format!("{place}（{e}）"))).collect();
+    let mut msg = if results.len() == 1 {
+        match &results[0].1 {
+            Ok(()) => format!("{} のフレーム {frame} に中間点を足しました", results[0].0),
+            Err(_) => format!("フレーム {frame} に中間点を足せませんでした"),
+        }
+    } else {
+        format!("選んだ {} 個のうち {ok} 個のフレーム {frame} に中間点を足しました", results.len())
+    };
+    if !failed.is_empty() {
+        msg.push_str(&format!("。足せなかったもの: {}", failed.join("、")));
+    }
+    (msg, !failed.is_empty())
+}
+
+/// タイムラインの右クリック（オブジェクト）から: 選んだオブジェクト全部の今のフレームに中間点を足す（1 回の編集 = 本体の Undo 1 回分）。
+/// 先頭だけにすると、複数選んだときに残りを黙って無視することになるので、全部に足してそれぞれの結果を数える
+/// （ルール au2-plugin-checklist「複数のオブジェクトを選んだ状態でも動く」）。選択が無ければフォーカス中のオブジェクトに足す。
 /// メニューを選んだときだけ書く（ルール au2-rs-plugin）
 fn add_midpoint_from_menu() {
-    let result = EDIT_HANDLE.call_edit_section(|edit| -> Result<String, String> {
-        let handle = match edit.get_selected_objects() {
-            Ok(v) if !v.is_empty() => v[0],
-            _ => edit.get_focused_object().ok().flatten().ok_or("オブジェクトが選ばれていません")?,
+    let result = EDIT_HANDLE.call_edit_section(|edit| -> Result<(String, bool), String> {
+        let handles = match edit.get_selected_objects() {
+            Ok(v) if !v.is_empty() => v,
+            _ => vec![edit.get_focused_object().ok().flatten().ok_or("オブジェクトが選ばれていません")?],
         };
         let frame = edit.info.frame;
-        let lf = edit.get_object_layer_frame(handle).map_err(|e| e.to_string())?;
-        if frame <= lf.start || frame >= lf.end {
-            return Err(format!("今のフレーム {frame} はオブジェクトの中（{}〜{}）ではありません", lf.start + 1, lf.end - 1));
-        }
-        edit.create_object_section(handle, frame).map_err(|e| format!("フレーム {frame} に中間点を足せませんでした（既にある位置かもしれません）: {e}"))?;
-        Ok(format!("フレーム {frame} に中間点を足しました"))
+        let results: Vec<(String, Result<(), String>)> = handles
+            .iter()
+            .enumerate()
+            .map(|(n, &h)| {
+                let place = match edit.get_object_layer_frame(h) {
+                    Ok(lf) => format!("L{} {}-{}", lf.layer + 1, lf.start, lf.end),
+                    Err(_) => format!("{} 個目", n + 1),
+                };
+                (place, add_midpoint_one(edit, h, frame))
+            })
+            .collect();
+        Ok(summarize_menu(frame, &results))
     });
-    match result {
-        Ok(Ok(msg)) => tracing::info!("[MidpointTable_H] {msg}"),
-        Ok(Err(e)) => tracing::warn!("[MidpointTable_H] {e}"),
-        Err(e) => tracing::error!("[MidpointTable_H] 書き込みを始められませんでした: {e}"),
+    let (msg, error) = match result {
+        Ok(Ok((msg, error))) => (msg, error),
+        Ok(Err(e)) => (e, true),
+        Err(e) => (format!("書き込みを始められませんでした: {e}"), true),
+    };
+    if error {
+        tracing::warn!("[MidpointTable_H] {msg}");
+    } else {
+        tracing::info!("[MidpointTable_H] {msg}");
+    }
+    *MENU_RESULT.lock() = Some((msg, error));
+    if let Some(ctx) = EGUI_CTX.get() {
+        ctx.request_repaint();
     }
 }
 
@@ -159,3 +210,26 @@ impl aviutl2::generic::GenericPlugin for MidpointTablePlugin {
 
 // 本体が呼ぶ関数（GetCommonPluginTable など）を書き出す（ルール au2-rs-plugin「ビルド」）
 aviutl2::register_generic_plugin!(MidpointTablePlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_menu;
+
+    #[test]
+    fn menu_summary_counts_each_object() {
+        let one = [("L1 0-59".to_string(), Ok(()))];
+        assert_eq!(summarize_menu(30, &one), ("L1 0-59 のフレーム 30 に中間点を足しました".to_string(), false));
+        let one_failed = [("L1 0-59".to_string(), Err("既に中間点があります".to_string()))];
+        let (msg, error) = summarize_menu(30, &one_failed);
+        assert!(error && msg.contains("足せなかったもの: L1 0-59（既に中間点があります）"));
+        let three = [
+            ("L1 0-59".to_string(), Ok(())),
+            ("L2 40-99".to_string(), Err("今のフレームがオブジェクトの中（開始と終了の間）にありません".to_string())),
+            ("L3 0-59".to_string(), Ok(())),
+        ];
+        let (msg, error) = summarize_menu(30, &three);
+        assert!(error);
+        assert!(msg.starts_with("選んだ 3 個のうち 2 個のフレーム 30 に中間点を足しました"));
+        assert!(msg.contains("L2 40-99"));
+    }
+}

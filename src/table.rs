@@ -3,6 +3,8 @@
 //! 書き換えは「未反映」として持ち、`write_jobs` で列ごとの書き込みにまとめる。本体へ書くのは
 //! 「反映」を押したときだけ（`edit_ops::apply`）。
 
+use std::cell::Cell;
+
 use crate::movement::ParamDef;
 use crate::track;
 
@@ -51,6 +53,10 @@ pub struct Column {
     pub flags_edit: Option<u32>,
     /// 書き換えた設定値（未反映）。数は移動方法の定義に合わせる
     pub param_edit: Option<Vec<f64>>,
+    /// `all_same` と `edited_count` の結果。どちらも全部の点を文字列にして比べるので、セルを書き換えるまで覚えておく。
+    /// 移動なしの列ではセル 1 つを描くたびに `all_same` が数回呼ばれ、点 1800 個で 1 フレーム 330 ms かかっていた（v0.5.3）
+    same_cache: Cell<Option<bool>>,
+    edited_cache: Cell<Option<usize>>,
 }
 
 impl Column {
@@ -74,6 +80,8 @@ impl Column {
             decelerate: false,
             flags_edit: None,
             param_edit: None,
+            same_cache: Cell::new(None),
+            edited_cache: Cell::new(None),
         };
         match track::parse(raw) {
             Ok(t) => {
@@ -120,13 +128,29 @@ impl Column {
     }
 
     pub fn edited_count(&self) -> usize {
-        (0..self.base.len()).filter(|&r| self.is_edited(r)).count()
+        if let Some(n) = self.edited_cache.get() {
+            return n;
+        }
+        let n = (0..self.base.len()).filter(|&r| self.is_edited(r)).count();
+        self.edited_cache.set(Some(n));
+        n
     }
 
     /// 全部の点が同じ値（移動なしにできる）
     pub fn all_same(&self) -> bool {
+        if let Some(same) = self.same_cache.get() {
+            return same;
+        }
         let first = self.text(0);
-        (1..self.base.len()).all(|r| self.text(r) == first)
+        let same = (1..self.base.len()).all(|r| self.text(r) == first);
+        self.same_cache.set(Some(same));
+        same
+    }
+
+    /// セルの値を変えたら、覚えておいた結果を捨てる
+    fn values_changed(&self) {
+        self.same_cache.set(None);
+        self.edited_cache.set(None);
     }
 
     /// 移動なしの列で、移動方法を選んでいないのに点ごとに違う値になっている（既定の直線移動で書く）
@@ -284,6 +308,11 @@ impl Column {
 
     /// 始点と終点の 2 つだけで保存される（設定の中間点無視、または再生範囲）。書くときの移動方法で決まる
     pub fn twopoint(&self) -> bool {
+        // 移動なしの列で移動方法を選んでいなければ、書くのは移動なしか既定の直線移動で、中間点無視を立てない限り 2 つにならない。
+        // そのときは全部の点を比べない（`all_same`）。範囲をまとめて書き換えると 1 セルごとにここを通り、点の数の 2 乗になる
+        if self.is_static() && self.mode_change.is_none() && self.flags_edit.is_none_or(|f| f & track::FLAG_TWOPOINT == 0) {
+            return false;
+        }
         self.effective_mode().is_some_and(|(m, t)| two_value(&m, t.as_deref()))
     }
 
@@ -299,6 +328,7 @@ impl Column {
     pub(crate) fn set(&mut self, row: usize, v: f64) {
         if self.editable(row) && v.is_finite() {
             self.edits[row] = Some(v);
+            self.values_changed();
         }
     }
 
@@ -332,6 +362,7 @@ impl Column {
 
     pub fn discard(&mut self) {
         self.edits.iter_mut().for_each(|e| *e = None);
+        self.values_changed();
         self.mode_change = None;
         self.flags_edit = None;
         self.param_edit = None;
@@ -927,6 +958,21 @@ mod tests {
         assert_eq!(t.selection, Some(Selection { anchor: (0, 0), end: (2, 1) }));
         t.move_selection(9, 9, false);
         assert_eq!(t.selection, Some(Selection::single((3, 3))));
+    }
+
+    #[test]
+    fn static_column_with_twopoint_flag() {
+        // 移動なしの列でも、点ごとに違う値にして中間点無視を立てれば、途中の行は保存されない
+        let mut t = table();
+        t.set_cell(3, 1, 50.0);
+        assert!(!t.columns[1].twopoint());
+        t.columns[1].set_flags(track::FLAG_TWOPOINT);
+        assert!(t.columns[1].twopoint() && t.columns[1].is_ignored_row(1));
+        assert_eq!(t.columns[1].output(), "0.00,50.00,直線移動,4");
+        // 全部同じ値に戻すと移動なしで、中間点無視も効かない
+        t.set_cell(3, 1, 0.0);
+        assert!(!t.columns[1].twopoint());
+        assert_eq!(t.columns[1].output(), "0.00");
     }
 
     #[test]

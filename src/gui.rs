@@ -13,6 +13,12 @@
 //! aviutl2-eframe は egui のどこにもフォーカスが無いときだけキーを本体へ渡す（`egui_wants_keyboard_input`）ので、
 //! セルをクリックしたらそのセルにフォーカスを置き、本体のオブジェクトのコピー・貼り付けとして働かないようにする。
 //! Esc でフォーカスを外すと、キーは本体へ戻る。
+//!
+//! 周期複製と設定のウィンドウは、パネルの高さに収まるように作る（収まらない分は中をスクロール）。
+//! どこにもフォーカスが無いときの Esc で閉じる（パネルが低いと × が見えなくなっていた。v0.5.3）。
+//! このときの Esc は aviutl2-eframe が本体にも渡す（本体の Esc に割り当ては無い）。
+//! egui はフレームの始めに Esc でフォーカスを外すので、「フォーカスが無かったか」は前のフレームの終わりに覚えた値で見る。
+//! 数値の入力欄は、確定（Enter・ほかをクリック）したときだけ値にし、入力中の Esc では入力前の値に戻す
 
 use std::time::{Duration, Instant};
 
@@ -95,6 +101,10 @@ pub struct MidpointTableApp {
     order_request: Option<(String, Option<Vec<String>>)>,
     /// 周期複製のウィンドウ
     dup_open: bool,
+    /// 周期複製のウィンドウの「ずらす量」の一覧以外の高さ（前のフレームで測る。パネルに収めるのに使う）
+    dup_fixed_h: f32,
+    /// 前のフレームの終わりに、どこかにフォーカスがあったか・ポップアップが開いていたか（Esc で閉じる判定に使う）
+    busy_last_frame: bool,
     dup_interval: usize,
     dup_count: usize,
     dup_below: bool,
@@ -143,6 +153,8 @@ impl MidpointTableApp {
             hide_request: None,
             order_request: None,
             dup_open: false,
+            dup_fixed_h: 300.0,
+            busy_last_frame: false,
             dup_interval: 0,
             dup_count: 3,
             dup_below: false,
@@ -335,6 +347,7 @@ impl MidpointTableApp {
                  セルを横にドラッグで値を増減（Shift で 1/10、Ctrl で 10 倍）。選んだ範囲の中を掴むと範囲全部が動く\n\
                  Shift+クリック・Shift+矢印で範囲を選ぶ\n\
                  セルを選んでいる間は Ctrl+C / Ctrl+V / 矢印 が表に効き、本体には渡りません。Esc で本体に戻します\n\
+                 どこも選んでいないときの Esc で、周期複製・設定のウィンドウを閉じます\n\
                  書き換えは「反映」を押すまで本体に書きません",
             );
             if self.key_focus.is_some() {
@@ -427,14 +440,14 @@ impl MidpointTableApp {
         let has_sel = self.loaded.as_ref().is_some_and(|l| l.table.selection.is_some());
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(has_sel, |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.add_text).desired_width(48.0));
+                number_text(ui, &mut self.add_text);
                 if ui.button("足す").on_hover_text("選んだセルに、左の値を足します").clicked() {
                     match self.add_text.trim().parse::<f64>() {
                         Ok(d) => self.with_table(|t| t.add(d)),
                         Err(_) => self.set_status("足す値が数値ではありません", true),
                     }
                 }
-                ui.add(egui::TextEdit::singleline(&mut self.mul_text).desired_width(48.0));
+                number_text(ui, &mut self.mul_text);
                 if ui.button("掛ける").on_hover_text("選んだセルに、左の値を掛けます").clicked() {
                     match self.mul_text.trim().parse::<f64>() {
                         Ok(k) => self.with_table(|t| t.mul(k)),
@@ -1040,12 +1053,19 @@ impl MidpointTableApp {
                     } else {
                         format!("設定: {} #{} / {}", col.effect, col.index + 1, col.item)
                     };
+                    let area = ui.ctx().content_rect().shrink(4.0);
                     egui::Window::new(title)
                         .id(egui::Id::new("midpoint_settings"))
                         .open(&mut open)
                         .collapsible(false)
                         .resizable(false)
-                        .show(ui.ctx(), |ui| settings_editor(ui, c, col, &self.movements));
+                        .constrain_to(area)
+                        .show(ui.ctx(), |ui| {
+                            // パネルが低いときも見出し（×）が隠れないように、中をスクロールさせる
+                            egui::ScrollArea::vertical()
+                                .max_height((area.height() - 40.0).max(60.0))
+                                .show(ui, |ui| settings_editor(ui, c, col, &self.movements));
+                        });
                     if !open {
                         self.settings_col = None;
                     }
@@ -1053,6 +1073,50 @@ impl MidpointTableApp {
             }
         }
     }
+}
+
+/// 「足す」「掛ける」の値の入力欄。入力中に Esc を押すと、入力を始める前の文字に戻す
+fn number_text(ui: &mut egui::Ui, text: &mut String) {
+    let resp = ui.add(egui::TextEdit::singleline(text).desired_width(48.0));
+    let key = resp.id.with("before_edit");
+    if resp.gained_focus() {
+        ui.data_mut(|d| d.insert_temp(key, text.clone()));
+    }
+    if resp.lost_focus() {
+        let before = ui.data_mut(|d| d.remove_temp::<String>(key));
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if let Some(b) = before {
+                *text = b;
+            }
+        }
+    }
+}
+
+/// 数値の欄（ルール au2-rs-plugin「入力の確定と取り消し」）。打っている途中の値は使わず、Enter かほかをクリックしたときに確定する。
+/// 入力中の Esc は入力前の値に戻す。ドラッグで変えた値はその場で使う。
+///
+/// egui 0.36.2 の `DragValue` は `update_while_editing(false)` でも、Esc の次のフレームで打った文字を値にしてしまう
+/// （フォーカスを失ったとみなす期間が 2 フレームあり、2 フレーム目には Esc が押されていない）。
+/// Esc のフレームの値を覚えておき、次のフレームで戻す（参照実装 `LayerSilenceCut_H/src/gui.rs` の `setting_value`）
+fn committed_drag<T>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    style: impl for<'a> FnOnce(egui::DragValue<'a>) -> egui::DragValue<'a>,
+) -> egui::Response
+where
+    T: egui::emath::Numeric + Default + Send + Sync,
+{
+    let resp = ui.add(style(egui::DragValue::new(value).update_while_editing(false)));
+    let key = resp.id.with("escaped");
+    let pass = ui.ctx().cumulative_pass_nr();
+    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|d| d.insert_temp(key, (pass, *value)));
+    } else if let Some((at, before)) = ui.data_mut(|d| d.remove_temp::<(u64, T)>(key)) {
+        if pass == at + 1 {
+            *value = before;
+        }
+    }
+    resp
 }
 
 /// 列の移動方法を選ぶコンボボックス。
@@ -1203,7 +1267,7 @@ fn settings_editor(ui: &mut egui::Ui, c: usize, col: &mut Column, scan: &Scan) {
                     ui.label(&d.label);
                     match &d.kind {
                         movement::ParamKind::Number => {
-                            ui.add(egui::DragValue::new(&mut v[i]).speed(0.1));
+                            committed_drag(ui, &mut v[i], |d| d.speed(0.1));
                         }
                         movement::ParamKind::Check => {
                             let mut on = v[i] != 0.0;
@@ -1260,14 +1324,23 @@ impl MidpointTableApp {
             self.dup_deltas = vec![0.0; l.table.columns.len()];
         }
         let plan = edit_ops::placements(l.layer, first, len, self.dup_interval, self.dup_count, self.dup_below);
-        egui::Window::new("周期複製").id(egui::Id::new("midpoint_duplicate")).open(&mut open).resizable(false).show(ctx, |ui| {
+        // パネルに収める。「ずらす量」の一覧の高さを、パネルの高さから一覧以外の高さ（前のフレームで測った）を引いた残りにする
+        let area = ctx.content_rect().shrink(4.0);
+        let list_max = (area.height() - self.dup_fixed_h - 8.0).clamp(48.0, 240.0);
+        let mut list_h = 0.0;
+        let shown = egui::Window::new("周期複製")
+            .id(egui::Id::new("midpoint_duplicate"))
+            .open(&mut open)
+            .resizable(false)
+            .constrain_to(area)
+            .show(ctx, |ui| {
             ui.label(format!("対象: {}", l.label));
             egui::Grid::new("dup_opts").num_columns(2).show(ui, |ui| {
                 ui.label("間隔（フレーム）");
-                ui.add(egui::DragValue::new(&mut self.dup_interval).range(0..=100_000));
+                committed_drag(ui, &mut self.dup_interval, |d| d.range(0..=100_000));
                 ui.end_row();
                 ui.label("回数");
-                ui.add(egui::DragValue::new(&mut self.dup_count).range(1..=100));
+                committed_drag(ui, &mut self.dup_count, |d| d.range(1..=100));
                 ui.end_row();
                 ui.label("置き方");
                 ui.vertical(|ui| {
@@ -1278,18 +1351,19 @@ impl MidpointTableApp {
             });
             ui.separator();
             ui.label("1 つごとにずらす量（全部の点に足す）");
-            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+            let out = egui::ScrollArea::vertical().max_height(list_max).show(ui, |ui| {
                 egui::Grid::new("dup_deltas").num_columns(2).show(ui, |ui| {
                     for (c, col) in l.table.columns.iter().enumerate() {
                         if col.readonly.is_some() {
                             continue;
                         }
                         ui.label(format!("{} / {}", col.effect, col.item));
-                        ui.add(egui::DragValue::new(&mut self.dup_deltas[c]).speed(0.1));
+                        committed_drag(ui, &mut self.dup_deltas[c], |d| d.speed(0.1));
                         ui.end_row();
                     }
                 });
             });
+            list_h = out.inner_rect.height();
             ui.separator();
             match &plan {
                 Ok(p) => {
@@ -1308,6 +1382,9 @@ impl MidpointTableApp {
             }
             ui.weak("置き場所に別のオブジェクトがあるときは、何も作りません。値は書き換える前の値（未反映を含まない）からずらします");
         });
+        if let Some(r) = shown {
+            self.dup_fixed_h = (r.response.rect.height() - list_h).max(0.0);
+        }
         if !open {
             self.dup_open = false;
         }
@@ -1324,7 +1401,7 @@ impl MidpointTableApp {
                     (col.effect.clone(), col.index, col.item.clone(), (1..=n).map(|k| col.shifted(d * k as f64)).collect())
                 })
                 .collect();
-            match edit_ops::duplicate(l.handle, self.dup_interval, n, self.dup_below, shifts) {
+            match edit_ops::duplicate(l.bind(), self.dup_interval, n, self.dup_below, shifts) {
                 Ok(msg) => self.set_status(msg, false),
                 Err(e) => self.set_status(e, true),
             }
@@ -1347,6 +1424,17 @@ impl eframe::App for MidpointTableApp {
             return;
         }
         self.visible_since.get_or_insert_with(Instant::now);
+        // Esc で小さなウィンドウを閉じるのは、押す前にどこにもフォーカスが無く、ポップアップも開いていなかったときだけ
+        // （値の入力・表のキー操作・コンボボックスの Esc は、そちらを取り消すだけにする）。
+        // egui はこのフレームの始めに Esc でフォーカスを外している（`Memory::begin_pass`）ので、前のフレームの終わりの状態で見る
+        let esc_closes = ui.input(|i| i.key_pressed(egui::Key::Escape))
+            && !self.busy_last_frame
+            && self.editing.is_none()
+            && self.frame_editing.is_none();
+        // タイムラインのメニュー（中間点を足す）の結果
+        if let Some((msg, error)) = crate::MENU_RESULT.lock().take() {
+            self.set_status(msg, error);
+        }
         // セルを編集している間は監視で表を差し替えない
         if self.prefs.auto_reload {
             if self.editing.is_none() && self.frame_editing.is_none() {
@@ -1361,11 +1449,19 @@ impl eframe::App for MidpointTableApp {
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| self.render_table(ui));
         });
         self.render_duplicate(ui.ctx());
+        if esc_closes {
+            if self.settings_col.is_some() {
+                self.settings_col = None;
+            } else {
+                self.dup_open = false;
+            }
+        }
+        self.busy_last_frame = ui.ctx().memory(|m| m.focused().is_some()) || ui.ctx().any_popup_open();
         // 中間点を足す・動かす・消す（ボタン・メニューを押したときだけ。1 回が本体の Undo 1 回分）
         if let Some(op) = self.struct_request.take() {
             if self.pending() == 0 {
-                if let Some(h) = self.loaded.as_ref().map(|l| l.handle) {
-                    match edit_ops::change_structure(h, op) {
+                if let Some((h, bind)) = self.loaded.as_ref().map(|l| (l.handle, l.bind())) {
+                    match edit_ops::change_structure(bind, op) {
                         Ok(msg) => self.set_status(msg, false),
                         Err(e) => self.set_status(e, true),
                     }
@@ -1394,6 +1490,83 @@ impl eframe::App for MidpointTableApp {
                     self.load(h);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{committed_drag, number_text};
+    use aviutl2_eframe::egui;
+
+    fn key(k: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    /// 1 フレーム回す。テクスチャの差分は使わないので捨てる（捨てずに落とすと、デバッグビルドで epaint の検査が止める）
+    fn run(ctx: &egui::Context, events: Vec<egui::Event>, f: impl FnMut(&mut egui::Ui)) {
+        let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, f);
+        out.textures_delta.clear();
+    }
+
+    fn frame_drag(ctx: &egui::Context, v: &mut usize, events: Vec<egui::Event>) {
+        run(ctx, events, |ui| {
+            committed_drag(ui, v, |d| d.range(0..=100_000));
+        });
+    }
+
+    /// Tab で欄にフォーカスを移し、全部選んで `typed` を打つ（まだ確定しない）
+    fn type_into(ctx: &egui::Context, v: &mut usize, typed: &str) {
+        frame_drag(ctx, v, vec![]);
+        frame_drag(ctx, v, vec![key(egui::Key::Tab, egui::Modifiers::NONE)]);
+        frame_drag(ctx, v, vec![key(egui::Key::A, egui::Modifiers::COMMAND), egui::Event::Text(typed.into())]);
+    }
+
+    #[test]
+    fn drag_value_applies_typed_value_only_on_enter() {
+        let ctx = egui::Context::default();
+        let mut v = 30;
+        type_into(&ctx, &mut v, "90");
+        assert_eq!(v, 30, "打っている途中は値にしない");
+        frame_drag(&ctx, &mut v, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert_eq!(v, 90, "Enter で打った値になる");
+    }
+
+    #[test]
+    fn drag_value_escape_discards_typed_value() {
+        let ctx = egui::Context::default();
+        let mut v = 30;
+        type_into(&ctx, &mut v, "90");
+        frame_drag(&ctx, &mut v, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+        assert_eq!(v, 30, "Esc で入力前の値のまま");
+        // egui はフォーカスが外れてから 2 フレームのあいだ「外れた」と扱う。その後のフレームでも打った値が入らないこと
+        for _ in 0..3 {
+            frame_drag(&ctx, &mut v, vec![]);
+            assert_eq!(v, 30, "Esc の後のフレームでも入力前の値のまま");
+        }
+    }
+
+    fn frame_text(ctx: &egui::Context, t: &mut String, focus: bool, events: Vec<egui::Event>) {
+        // Tab で欄にフォーカスを移す（クリックと同じ）
+        let events = if focus { vec![key(egui::Key::Tab, egui::Modifiers::NONE)] } else { events };
+        run(ctx, events, |ui| {
+            number_text(ui, t);
+        });
+    }
+
+    #[test]
+    fn number_text_reverts_on_escape() {
+        let ctx = egui::Context::default();
+        let mut t = String::from("10");
+        frame_text(&ctx, &mut t, true, vec![]);
+        frame_text(&ctx, &mut t, false, vec![]);
+        frame_text(&ctx, &mut t, false, vec![egui::Event::Text("5".into())]);
+        assert_eq!(t, "105", "打っている途中の文字は欄に出る");
+        frame_text(&ctx, &mut t, false, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+        assert_eq!(t, "10", "入力中の Esc で入力前の文字に戻る");
+        for _ in 0..3 {
+            frame_text(&ctx, &mut t, false, vec![]);
+            assert_eq!(t, "10");
         }
     }
 }
